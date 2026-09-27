@@ -20,9 +20,21 @@ var (
 )
 
 type diskCache struct {
-	Resolve map[string]resolveEntry  `json:"resolve"` // темы → Release, рейтинги imdb:/mal:
-	RSS     map[string]rssCacheEntry `json:"rss"`     // родные ленты подписок + страницы топа
-	Saved   time.Time                `json:"saved"`
+	Resolve map[string]diskResolve `json:"resolve"` // темы → Release, рейтинги imdb:/mal:
+	RSS     map[string]diskRSS     `json:"rss"`     // родные ленты подписок + страницы топа
+	Saved   time.Time              `json:"saved"`
+}
+
+// тени с экспортированными полями: resolveEntry/rssCacheEntry в памяти имеют
+// неэкспортированные поля — json.Marshal выгрузил бы их как {} (так и случилось)
+type diskResolve struct {
+	TS  time.Time `json:"ts"`
+	Rel Release   `json:"rel"`
+}
+
+type diskRSS struct {
+	TS   time.Time `json:"ts"`
+	Body string    `json:"body"`
 }
 
 // loadDiskCache — warm start: накопленное не теряется на рестартах
@@ -36,15 +48,22 @@ func loadDiskCache() {
 		return
 	}
 	cacheMu.Lock()
+	nr, ns := 0, 0
 	for k, v := range dc.Resolve {
-		resolveCache[k] = v
+		if !v.TS.IsZero() && v.Rel.Hash != "" {
+			resolveCache[k] = resolveEntry{ts: v.TS, rel: v.Rel}
+			nr++
+		}
 	}
 	for k, v := range dc.RSS {
-		rssCache[k] = v
+		if !v.TS.IsZero() && v.Body != "" {
+			rssCache[k] = rssCacheEntry{ts: v.TS, body: v.Body}
+			ns++
+		}
 	}
 	cacheMu.Unlock()
 	log.Printf("кэш: загружено %d резолвов, %d лент (сохранено %s)",
-		len(dc.Resolve), len(dc.RSS), dc.Saved.Format("02.01 15:04"))
+		nr, ns, dc.Saved.Format("02.01 15:04"))
 }
 
 // markCacheDirty — под cacheMu, в блоках записи кэшей
@@ -58,24 +77,28 @@ func startCacheSaver() {
 			dirty := cacheDirty
 			cacheDirty = false
 			cutoff := time.Now().Add(-72 * time.Hour)
-			resolve := make(map[string]resolveEntry, len(resolveCache))
+			dresolve := make(map[string]diskResolve, len(resolveCache))
+			keepResolve := make(map[string]resolveEntry, len(resolveCache))
 			for k, v := range resolveCache {
 				if v.ts.After(cutoff) {
-					resolve[k] = v
+					dresolve[k] = diskResolve{TS: v.ts, Rel: v.rel}
+					keepResolve[k] = v
 				}
 			}
-			rss := make(map[string]rssCacheEntry, len(rssCache))
+			drss := make(map[string]diskRSS, len(rssCache))
+			keepRSS := make(map[string]rssCacheEntry, len(rssCache))
 			for k, v := range rssCache {
 				if v.ts.After(cutoff) {
-					rss[k] = v
+					drss[k] = diskRSS{TS: v.ts, Body: v.body}
+					keepRSS[k] = v
 				}
 			}
-			resolveCache, rssCache = resolve, rss
+			resolveCache, rssCache = keepResolve, keepRSS // 72 ч: старое вычищаем
 			cacheMu.Unlock()
 			if !dirty {
 				continue
 			}
-			raw, err := json.Marshal(diskCache{Resolve: resolve, RSS: rss, Saved: time.Now()})
+			raw, err := json.Marshal(diskCache{Resolve: dresolve, RSS: drss, Saved: time.Now()})
 			if err != nil {
 				continue
 			}

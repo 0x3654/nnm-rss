@@ -64,6 +64,8 @@
   .histrow { display:flex; justify-content:flex-end; margin:0 0 4px; }
   .histlink { font-size:13px; color:var(--muted); text-decoration:none; cursor:pointer; }
   .histlink:hover { color:var(--accent); }
+  .nnmlink { font-size:12px; color:var(--muted); text-decoration:none; }
+  .nnmlink:hover { color:var(--accent); }
 
   .sub { display:flex; align-items:center; gap:10px; padding:10px 0; border-top:1px solid var(--line); }
   .subgr > .sub:first-of-type { border-top:0; padding-top:4px; }
@@ -417,20 +419,58 @@ function makeBuilder(mountId) {
 
   const set = (incStr, excStr) => {
     sel.inc.clear(); sel.exc.clear(); customs.length = 0;
+    // токенайзер паттерна: эскейп-пары «\\X» — целиком, группы (?:…) — до
+    // своей «)», «|» верхнего уровня — разделитель альтернатив. Регэкспами
+    // нельзя: «своё» со скобками после эскейпа ломает групповую грамматику
+    const tokenize = str => {
+      const parts = []; // {p: плоская альтернатива} | {g: содержимое группы}
+      let cur = '', grp = null;
+      for (let j = 0; j < str.length; j++) {
+        const c = str[j];
+        if (c === '\\') { const pair = c + (str[j + 1] || ''); if (grp !== null) grp += pair; else cur += pair; j++; continue; }
+        if (grp === null && c === '(' && str[j + 1] === '?' && str[j + 2] === ':') { if (cur.trim()) parts.push({p: cur}); cur = ''; grp = ''; j += 2; continue; }
+        if (grp !== null && c === ')') { parts.push({g: grp}); grp = null; continue; }
+        if (grp === null && c === '|') { parts.push({p: cur}); cur = ''; continue; }
+        if (grp !== null) grp += c; else cur += c;
+      }
+      if (cur.trim() || cur) parts.push({p: cur});
+      return parts;
+    };
     const mark = (str, side) => {
-      let rest = str || '';
+      if (!str) return;
+      const parts = tokenize(str);
+      // группы — «свои» условия: якоря ^…$ = «равно», распакованные эскейпы;
+      // содержимое старых артефактов могло быть через «|» — берём частями
+      for (const pt of parts) {
+        if (pt.g === undefined) continue;
+        let inner = pt.g;
+        let mode = side === 'inc' ? 'has' : 'hasNot';
+        if (/^\^.*\$$/.test(inner)) { inner = inner.slice(1, -1); mode = mode === 'has' ? 'eq' : 'notEq'; }
+        // текст «своего» всегда литеральный и на сохранении полностью
+        // эскейпится — распаковываем так же полностью, иначе бэкслеши
+        // копились бы с каждым сохранением
+        inner = inner.replace(/\\(.)/g, '$1');
+        for (const t of inner.split('|')) {
+          const v = t.trim();
+          if (v) customs.push({text: v, mode});
+        }
+      }
+      // плоские альтернативы — пресеты: зажигается, только если есть ВСЕ
+      // альтернативы пресета; непризнанные огрызки — «своим», юзер удалит
+      const frags = parts.filter(pt => pt.g === undefined).map(pt => pt.p.trim()).filter(Boolean);
       for (const g of PRESETS) {
         if (g.side !== side) continue;
         for (const [label, re] of g.items) {
-          const rx = new RegExp(re, 'i');
-          if (rx.test(rest)) {
+          const idx = re.split('|').map(a => frags.indexOf(a));
+          if (idx.every(i => i >= 0)) {
             sel[side].set(label, re);
-            rest = rest.replace(rx, '');
+            idx.sort((a, b) => b - a).forEach(i => frags.splice(i, 1));
           }
         }
       }
-      rest = rest.replace(/^\s*\|\s*|\s*\|\s*$/g, '').replace(/\|\s*\|/g, '|').trim();
-      if (rest) customs.push({text: rest, mode: side === 'inc' ? 'has' : 'hasNot'});
+      for (const t of frags) {
+        customs.push({text: t.replace(/\\(.)/g, '$1'), mode: side === 'inc' ? 'has' : 'hasNot'});
+      }
     };
     mark(incStr, 'inc');
     mark(excStr, 'exc');
@@ -582,6 +622,7 @@ function renderSubs() {
           <small>${s.kind === 'forum'
             ? '<a href="#" class="autobadge" style="text-decoration:none">' + (s.auto ? '<span class="badge auto">тоже в авто</span>' : '<span class="badge">только просмотр</span>') + '</a>'
             : '<span class="badge auto">авто</span>'} ${esc(flt)}</small>
+          <small><a class="nnmlink" href="https://nnmclub.to/forum/viewtopic.php?t=${s.nnm_id}" target="_blank" rel="noopener">раздача на NNM ↗</a></small>
         </div>
         <label class="sw" title="вкл/выкл подписку"><input type="checkbox" ${s.enabled ? 'checked' : ''}><i></i></label>
         <button class="ghost mini" title="изменить фильтры">✎</button>
@@ -624,6 +665,7 @@ function renderSubs() {
         <div class="t">
           <b>${esc(name)}</b>
           <small>${leaves.length > 1 ? leaves.length + ' подфорумов · ' : ''}${esc(flt)}</small>
+          <small><a class="nnmlink" href="https://nnmclub.to/forum/tracker.php?f=${leaves[0].root_id || leaves[0].nnm_id}" target="_blank" rel="noopener">раздел на NNM ↗</a></small>
         </div>
         <label class="sw" title="вкл/выкл"><input type="checkbox" ${leaves[0].enabled ? 'checked' : ''}><i></i></label>
         <button class="ghost mini" title="изменить фильтры (на все подфорумы)">✎</button>

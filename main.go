@@ -205,6 +205,15 @@ func cachedRSS(s *Sub) (string, error) {
 	return body, nil
 }
 
+// staleRSS — последнее известное тело родной ленты без учёта TTL: при 503
+// отдаём его, чтобы подписка не исчезала из ленты на время троттлинга
+func staleRSS(s *Sub) (string, bool) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	e, ok := rssCache[s.Kind+":"+strconv.Itoa(s.NNMID)]
+	return e.body, ok && e.body != ""
+}
+
 // buildFeed — XML личной ленты, новые сверху. all=false — авто-лента:
 // подписки-раздачи с тумблером «авто». all=true — лента разделов: только
 // подписки-разделы (поиск нового), без раздач из авто.
@@ -283,8 +292,14 @@ func buildFeed(p *Profile, all bool) ([]byte, []HistItem, error) {
 
 		body, err := cachedRSS(s)
 		if err != nil {
-			log.Printf("feed %.8s…/%s: %v", p.Passkey, s.Title, err)
-			continue
+			// троттлинг nnm: берём последнее известное тело ленты из кэша
+			st, ok := staleRSS(s)
+			if !ok {
+				log.Printf("feed %.8s…/%s: %v", p.Passkey, s.Title, err)
+				continue
+			}
+			log.Printf("feed %.8s…/%s: %v — из кэша", p.Passkey, s.Title, err)
+			body = st
 		}
 
 		if s.Kind == "topic" {
@@ -320,23 +335,10 @@ func buildFeed(p *Profile, all bool) ([]byte, []HistItem, error) {
 		items = append(items, v)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].at.After(items[j].at) })
-
-	// только новые фильмы и апгрейды качества: что уже выпускали — не повторяем
-	// (ранг выпущенного хранится в TopSeen профиля)
-	fresh := items[:0]
-	released := map[string]int{}
-	for _, k := range items {
-		key := filmKey(k.it.Title)
-		rank := filmQualityRank(k.it.Title)
-		if (p.TopSeen != nil) && p.TopSeen[key] >= rank {
-			continue
-		}
-		if rank > released[key] {
-			released[key] = rank
-		}
-		fresh = append(fresh, k)
-	}
-	items = fresh // новые сверху
+	// НЕ фильтруем по TopSeen: память топ-ленты глушила бы обновления
+	// обновляемых раздач (серии 1-6 → 1-7 — тот же фильм, тот же ранг качества).
+	// В личных лентах повторы решает guid с хэшем версии: батч обновился —
+	// новый hash — новый guid — клиент качает апдейт.
 	if len(items) > 100 {
 		items = items[:100]
 	}
@@ -360,16 +362,20 @@ func buildFeed(p *Profile, all bool) ([]byte, []HistItem, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			rel, err := resolveRelease(k.tid)
-			if err != nil {
-				// резолв не удался (трекер притормозил) — item без магнита
-				// клиенту бесполезен: не выпускаем, следующий опрос повторит
-				log.Printf("resolve %s: %v", k.it.Title, err)
-				k.drop = true
-				return
-			}
-			if rel.Hash == "" {
-				k.drop = true // без магнита ссылка мёртвая для клиента
-				return
+			if err != nil || rel.Hash == "" {
+				// трекер притормозил (503) или магнита нет: отдаём последнюю
+				// известную версию вместо выбрасывания item — лента не
+				// схлопывается, апдейт придёт новым guid'ом
+				if st, ok := staleResolve(k.tid); ok {
+					if err != nil {
+						log.Printf("resolve %s: %v — отдаю прошлую версию", k.it.Title, err)
+					}
+					rel = st
+				} else {
+					log.Printf("resolve %s: %v", k.it.Title, err)
+					k.drop = true
+					return
+				}
 			}
 			// версия раздачи в guid: батч обновился (новый hash) — новый item
 			if rel.Hash != "" {
@@ -684,15 +690,18 @@ func buildTopFeed(p *Profile, days int) ([]byte, []HistItem, map[string]int, err
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			rel, err := resolveRelease(k.tid)
-			if err != nil {
-				// item без магнита клиенту бесполезен: не выпускаем
-				log.Printf("resolve top %s: %v", k.it.Title, err)
-				k.drop = true
-				return
-			}
-			if rel.Hash == "" {
-				k.drop = true
-				return
+			if err != nil || rel.Hash == "" {
+				// троттлинг nnm: отдаём последнюю известную версию
+				if st, ok := staleResolve(k.tid); ok {
+					if err != nil {
+						log.Printf("resolve top %s: %v — отдаю прошлую версию", k.it.Title, err)
+					}
+					rel = st
+				} else {
+					log.Printf("resolve top %s: %v", k.it.Title, err)
+					k.drop = true
+					return
+				}
 			}
 			// не-русская раздача: ни кириллицы в названии, ни русского описания
 			if !hasCyrillic(k.it.Title) && !hasCyrillic(rel.Descr) {

@@ -332,6 +332,17 @@ func resolveRelease(topicID int) (Release, error) {
 	return rel, nil
 }
 
+// staleResolve — последний известный резолв темы БЕЗ учёта TTL (персистентный
+// кэш живёт 72 ч): когда nnm троттлит (HTTP 503), отдаём прошлую версию раздачи
+// вместо выбрасывания item — клиент не теряет раздачу, апдейт доедет новым
+// guid'ом, когда трекер снова ответит
+func staleResolve(topicID int) (Release, bool) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	e, ok := resolveCache[fmt.Sprintf("topic:%d", topicID)]
+	return e.rel, ok && e.rel.Hash != ""
+}
+
 var (
 	omdbRateRe  = regexp.MustCompile(`"imdbRating":"([0-9.]+?)"`)
 	omdbVotesRe = regexp.MustCompile(`"imdbVotes":"([0-9,]+?)"`)
