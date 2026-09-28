@@ -6,10 +6,19 @@
 // DHT/PEX, статистика на трекере не считается.
 //
 // GET  /                     — публичная главная + «Моя подписка» (веб)
-// POST /api/login            — вход/регистрация (логин+пароль, кука s)
+// POST /api/login            — вход/регистрация (логин+пароль, кука s);
+//
+//	JSON-запрос → {"token"} — для плагинов (Bearer)
+//
 // POST /api/logout, POST /api/passwd
 // GET  /api/me               — мой профиль (подписки, история, лента)
 // POST /api/subs, PATCH/DELETE /api/subs/{id}
+//
+//	в /api/subs принимается и магнет — разовая
+//	раздача в авто-ленту (kind=hash, живёт в подписках
+//	как обычная); /api/* — CORS + Authorization:
+//	Bearer <token> как альтернатива куке
+//
 // GET  /rss/{токен}          — личная лента (+/all, +/top/{дни})
 // GET  /healthz
 //
@@ -124,9 +133,19 @@ func sessionCookie(tok string, r *http.Request) *http.Cookie {
 		MaxAge: 5 * 365 * 24 * 3600}
 }
 
-// currentProfile — профиль по куке сессии s (WebToken); наследие: старая
-// кука pk со входом по коду тоже открывает страницу. Вызывать под stateMu.
+// currentProfile — профиль по куке сессии s (WebToken); плагинам (Lampa) —
+// тот же токен в Authorization: Bearer (кука SameSite=Strict кросс-доменно
+// не приходит); наследие: старая кука pk со входом по коду тоже открывает
+// страницу. Вызывать под stateMu.
 func currentProfile(r *http.Request) *Profile {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		tok := strings.ToLower(strings.TrimSpace(h[len("Bearer "):]))
+		if passkeyRe.MatchString(tok) {
+			if p := profileByWebToken(tok); p != nil {
+				return p
+			}
+		}
+	}
 	if c, err := r.Cookie("s"); err == nil {
 		tok := strings.ToLower(strings.TrimSpace(c.Value))
 		if passkeyRe.MatchString(tok) {
@@ -278,6 +297,30 @@ func buildFeed(p *Profile, all bool) ([]byte, []HistItem, error) {
 		} else if !s.Auto {
 			continue
 		}
+
+		// разовая раздача (магнет из плагина): item сразу с известным хэшем,
+		// без родной ленты и резолва темы. Фильтры ленты не применяем —
+		// это явное желание юзера, а не поток раздач. Свежей раздаче даём
+		// DHT-резолверу до 20 с: первый же опрос ленты чаще всего получает
+		// http-.torrent (магнет в link игнорируют nasctl и transmission-rss)
+		if s.Kind == "hash" {
+			at := s.Added
+			if at.IsZero() {
+				at = time.Now()
+			}
+			if time.Since(at) < 10*time.Minute {
+				waitForTorrent(s.Hash, 20*time.Second)
+			}
+			it := feedItem{
+				Title:   s.Title,
+				Guid:    feedGuid{Value: "nnm-hash" + s.Hash, IsPermaLink: false},
+				PubDate: at.In(tz).Format(time.RFC1123Z),
+			}
+			applyTorrent(&it, s.Hash)
+			it.Desc = hashDescr(s.Title, s.Hash, s.Poster)
+			byGUID["h"+s.Hash] = keyItem{it: it, at: at, gid: "h" + s.Hash}
+			continue
+		}
 		var inc, exc *regexp.Regexp
 		if s.Filter != "" {
 			if re, err := regexp.Compile(`(?i)` + s.Filter); err == nil {
@@ -355,6 +398,9 @@ func buildFeed(p *Profile, all bool) ([]byte, []HistItem, error) {
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for idx := range items {
+		if items[idx].tid == 0 {
+			continue // разовая раздача: хэш уже применён, тема не резолвится
+		}
 		wg.Add(1)
 		k := &items[idx]
 		go func(k *keyItem) {
@@ -497,6 +543,27 @@ func applyTorrent(it *feedItem, hash string) {
 		it.Link = u
 		it.Enclosure = &feedEnclosure{URL: u, Length: st.Size(), Type: "application/x-bittorrent"}
 	}
+}
+
+// hashDescr — описание разовой раздачи (из плагина Lampa): без страницы
+// раздачи на трекере, поэтому магнит голым текстом (nasctl автолинкует,
+// остальным копируемо) и ссылка на нашу страницу /t/<hash> — максимальная
+// совместимость
+func hashDescr(title, hash, poster string) string {
+	page := ""
+	if selfURL != "" {
+		page = `<div style="margin:6px 0 0;font-size:12px">Раздача: ` + selfURL + "/t/" + hash + `</div>`
+	}
+	cover := ""
+	if poster != "" {
+		cover = `<div style="margin:0 0 8px"><img src="` + poster + `" width="300" style="max-width:100%;border-radius:8px"></div>`
+	}
+	return `<div style="font-family:sans-serif;font-size:13px;line-height:1.45">` +
+		cover +
+		`<div><b>` + html.EscapeString(title) + `</b></div>` +
+		`<div style="margin:6px 0 0">Разовая раздача (из Lampa)</div>` +
+		`<div style="margin:6px 0 0;font-size:12px">` + magnetLink(hash) + `</div>` +
+		page + `</div>`
 }
 
 // itemDescr — карточка как на странице раздачи. Постер — отдельной строкой
@@ -798,6 +865,65 @@ func k2id(gid string) int {
 	return n
 }
 
+// posterTried — hash-подписки, которым уже искали постер в этом процессе
+var (
+	posterTried = map[string]bool{}
+	posterMu    sync.Mutex
+)
+
+// sectionCovers — обложки строк «Разделы»: постер самой свежей раздачи корня
+// (родная лента раздела картинок не несёт, берём со страницы свежей темы;
+// и ленты, и резолвы уже за кэшем TTL/диск). Ключ — как в UI-группировке:
+// root_id листьев или s+id для подписок без корня
+func sectionCovers(subs []*Sub) map[string]string {
+	type leaf struct {
+		key    string
+		nnmID  int
+		newest rssItem
+		hasNew bool
+	}
+	byKey := map[string]*leaf{}
+	for _, s := range subs {
+		if s.Kind != "forum" || !s.Enabled {
+			continue
+		}
+		key := strconv.Itoa(s.RootID)
+		if s.RootID == 0 {
+			key = "s" + strconv.Itoa(s.NNMID)
+		}
+		l := byKey[key]
+		if l == nil {
+			l = &leaf{key: key, nnmID: s.NNMID}
+			byKey[key] = l
+		}
+		body, err := cachedRSS(s)
+		if err != nil {
+			if st, ok := staleRSS(s); ok {
+				body = st
+			} else {
+				continue
+			}
+		}
+		for _, it := range parseRSSItems(body) {
+			if !l.hasNew || it.Date.After(l.newest.Date) {
+				l.hasNew, l.newest = true, it
+			}
+		}
+	}
+	covers := map[string]string{}
+	for _, l := range byKey {
+		if !l.hasNew || l.newest.ID <= 0 {
+			continue
+		}
+		rel, err := resolveRelease(l.newest.ID)
+		if err != nil || rel.Poster == "" {
+			continue
+		}
+		covers[l.key] = rel.Poster
+	}
+	return covers
+}
+
 // ---------- HTTP
 
 func main() {
@@ -815,6 +941,27 @@ func main() {
 		hash := strings.TrimSuffix(name, ".torrent")
 		if len(hash) != 40 || strings.Trim(hash, "0123456789abcdefABCDEF") != "" {
 			http.NotFound(w, r)
+			return
+		}
+		// без «.torrent» — страница раздачи (название/файлы/магнет): прямой
+		// ссылки на трекер у разовой раздачи часто нет, «что это» смотрим здесь
+		if name == hash {
+			stateMu.Lock()
+			sub := (*Sub)(nil)
+			for _, p := range state.Profiles {
+				for _, s := range p.Subs {
+					if s.Kind == "hash" && s.Hash == strings.ToLower(hash) {
+						sub = s
+					}
+				}
+			}
+			stateMu.Unlock()
+			h := strings.ToLower(hash)
+			if sub == nil {
+				sub = &Sub{Kind: "hash", Hash: h}
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte(torrentPageHTML(sub)))
 			return
 		}
 		path := torrentPath(hash)
@@ -845,6 +992,32 @@ func main() {
 	// в динамических формах он распознаёт через раз).
 
 	credPOST := func(w http.ResponseWriter, r *http.Request, create bool) {
+		// JSON-ветка — для плагинов (Lampa): {login, password} → {token};
+		// без create — регистрация осталась только формой веб-интерфейса
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") && !create {
+			var in struct{ Login, Password string }
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+				writeErr(w, 400, "неправильный запрос")
+				return
+			}
+			login := strings.ToLower(strings.TrimSpace(in.Login))
+			stateMu.Lock()
+			p := profileByLogin(login)
+			if p == nil || p.PassHash == "" ||
+				bcrypt.CompareHashAndPassword([]byte(p.PassHash), []byte(in.Password)) != nil {
+				stateMu.Unlock()
+				writeErr(w, 401, "нет такого логина или неверный пароль")
+				return
+			}
+			if p.WebToken == "" {
+				p.WebToken = randHex(16)
+				saveState()
+			}
+			tok := p.WebToken
+			stateMu.Unlock()
+			writeJSON(w, 200, map[string]string{"token": tok})
+			return
+		}
 		login := strings.ToLower(strings.TrimSpace(r.PostFormValue("login")))
 		password := r.PostFormValue("password")
 		fail := func(msg string) {
@@ -1046,8 +1219,88 @@ a{color:var(--muted);font-size:13px;text-decoration:none}
 			"history_auto": p.HistoryAuto,
 			"history_all":  p.HistoryAll,
 		}
+		pk := p.Passkey
+		subs := make([]*Sub, len(p.Subs))
+		copy(subs, p.Subs)
+		needPoster := []*Sub{}
+		for _, s := range subs {
+			if s.Kind == "hash" && s.Poster == "" {
+				needPoster = append(needPoster, s)
+			}
+		}
 		stateMu.Unlock()
+		// обложки разделов — сеть, считаем без блокировки состояния
+		if covers := sectionCovers(subs); len(covers) > 0 {
+			resp["section_posters"] = covers
+		}
+		// разовым раздачам без постера — добор поиском, раз на процесс
+		for _, s := range needPoster {
+			posterMu.Lock()
+			tried := posterTried[s.Hash]
+			posterTried[s.Hash] = true
+			posterMu.Unlock()
+			if tried {
+				continue
+			}
+			go func(sid, title string) {
+				poster := hashPoster(title)
+				if poster == "" {
+					return
+				}
+				stateMu.Lock()
+				if live := profileByPassKeyExisting(pk).sub(sid); live != nil && live.Poster == "" {
+					live.Poster = poster
+					saveState()
+				}
+				stateMu.Unlock()
+			}(s.ID, s.Title)
+		}
 		writeJSON(w, 200, resp)
+	})
+
+	// ----- карточка раздачи для плагина Lampa: те же данные, из которых
+	// собирается description в лентах (постер/сюжет/техполя со страницы
+	// темы). Публичный GET — данные трекера открытые; тему можно задать
+	// напрямую (?t=<id>) или найти по названию разовой раздачи (?title=)
+
+	mux.HandleFunc("GET /api/card", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		id := atoiDefault(q.Get("t"))
+		if id == 0 {
+			title := q.Get("title")
+			if title == "" {
+				writeErr(w, 400, "нужен ?t=<id темы> или ?title=<название>")
+				return
+			}
+			id = searchTopicID(title)
+			if id == 0 {
+				writeErr(w, 404, "тема не найдена на трекере")
+				return
+			}
+		}
+		rel, err := resolveRelease(id)
+		if err != nil {
+			writeErr(w, 502, "NNM: "+err.Error())
+			return
+		}
+		if tt := imdbTT(rel.IMDb); tt != "" {
+			rel.IMDbRating, rel.IMDbVotes = imdbRating(tt)
+		}
+		writeJSON(w, 200, map[string]any{
+			"topic":       id,
+			"topic_url":   nnmBase + "/forum/viewtopic.php?t=" + strconv.Itoa(id),
+			"hash":        rel.Hash,
+			"poster":      rel.Poster,
+			"descr":       strings.ReplaceAll(rel.Descr, "¶", "\n"),
+			"tech":        rel.Tech,
+			"rating_img":  rel.RatingImg,
+			"kp":          rel.KP,
+			"imdb":        rel.IMDb,
+			"imdb_rating": rel.IMDbRating,
+			"imdb_votes":  rel.IMDbVotes,
+			"tor_name":    rel.TorName,
+			"tor_size":    rel.TorSize,
+		})
 	})
 
 	// ----- подписки
@@ -1056,6 +1309,7 @@ a{color:var(--muted);font-size:13px;text-decoration:none}
 		var in struct {
 			URL, Filter, Exclude string
 			Target               string // auto | forum — куда добавляем
+			Tracker, Size        string // kind=hash: инфа от парсера Lampa
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeErr(w, 400, "неправильный запрос")
@@ -1063,6 +1317,56 @@ a{color:var(--muted);font-size:13px;text-decoration:none}
 		}
 		if err := validateRegexes(in.Filter, in.Exclude); err != nil {
 			writeErr(w, 400, err.Error())
+			return
+		}
+
+		// магнет — разовая раздача (кнопка «В ленту авто» в Lampa): сразу
+		// в авто-ленту, NNM не дёргаем; .torrent соберёт DHT-резолвер
+		if mh, mn := parseMagnet(in.URL); mh != "" {
+			title := strings.TrimSpace(mn)
+			if title == "" {
+				title = "Раздача " + mh[:8]
+			}
+
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			p := currentProfile(r)
+			if p == nil {
+				writeErr(w, 401, "не авторизован")
+				return
+			}
+			for _, s := range p.Subs {
+				if s.Kind == "hash" && s.Hash == mh {
+					writeErr(w, 400, "уже в подписках")
+					return
+				}
+			}
+
+			s := &Sub{ID: randHex(8), Kind: "hash", Hash: mh, Title: title,
+				Auto: true, Enabled: true, Added: time.Now(),
+				Tracker: strings.TrimSpace(in.Tracker), Size: strings.TrimSpace(in.Size),
+				Page: magnetPageURL(in.URL)}
+			p.Subs = append(p.Subs, s)
+			invalidateFeed(p.Passkey)
+			prefetchTorrent(mh)
+			saveState()
+			log.Printf("sub+ %.8s… hash:%s (%s)", p.Passkey, mh[:8], title)
+			// обложку разовой раздаче ищем на трекере по названию — в фоне,
+			// страницу темы она не знает; найдём — сохранится в подписку
+			go func(sid string) {
+				poster := hashPoster(title)
+				if poster == "" {
+					return
+				}
+				stateMu.Lock()
+				if live := p.sub(sid); live != nil && live.Poster == "" {
+					live.Poster = poster
+					invalidateFeed(p.Passkey)
+					saveState()
+				}
+				stateMu.Unlock()
+			}(s.ID)
+			writeJSON(w, 200, s)
 			return
 		}
 
@@ -1497,7 +1801,23 @@ a{color:var(--muted);font-size:13px;text-decoration:none}
 		writeJSON(w, 200, map[string]string{"ok": "1"})
 	})
 
-	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// CORS для /api/* — плагин Lampa (страница lampa.mx) ходит сюда из браузера.
+	// Креденшелов-режима нет (Bearer-токен в заголовке, не кука), поэтому «*».
+	corsAPI := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	srv := &http.Server{Addr: ":" + port, Handler: corsAPI, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() {
 		sig := make(chan os.Signal, 1)

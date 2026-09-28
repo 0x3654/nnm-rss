@@ -6,10 +6,13 @@ package main
 // клиент аннонсит его ключом, статистика на трекере считается ему.
 
 import (
+	"encoding/base32"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -86,6 +89,107 @@ func decodeBody(raw []byte) string {
 	}
 	return string(decoded)
 }
+
+// hashPoster — обложка разовой (hash) раздачи: темы у неё нет, ищем на
+// трекере по названию («Курьер / Runner / 2026 / ДБ / WEB-DL (1080p)» →
+// «Курьер 2026»), найденную тему резолвим и берём постер. Промах/нет сети —
+// пусто, строка останется без картинки
+var hashNameYearRe = regexp.MustCompile(`^(.*?)/.*?[( ]((19|20)\d{2})`)
+
+func hashPoster(title string) string {
+	if id := searchTopicID(title); id > 0 {
+		if rel, err := resolveRelease(id); err == nil {
+			return rel.Poster
+		}
+	}
+	return ""
+}
+
+// searchTopicID — тема разовой раздачи по названию из dn плагина:
+// «Курьер / Runner / 2026 / ДБ / WEB-DL (1080p)» → id темы на трекере
+// (0 = не нашли). Два прохода: русское имя, затем оригинал
+func searchTopicID(title string) int {
+	m := hashNameYearRe.FindStringSubmatch(title)
+	if m == nil {
+		m = []string{"", title, "", ""}
+		if y := regexp.MustCompile(`((19|20)\d{2})`).FindStringSubmatch(title); y != nil {
+			m[2] = y[1]
+		}
+	}
+	// имя и оригинал («Курьер / Runner / 2026 / …»): оригинал спасает,
+	// когда форма русского у трекера и в dn плагина разошлась
+	// («Бегушая» у Lampa vs «Бегущая» на NNM)
+	name := strings.TrimSpace(strings.Split(m[1], "/")[0])
+	// оригинал — второй сегмент полного названия (m[1] обрезан по первой «/»)
+	orig := ""
+	if segs := strings.Split(title, "/"); len(segs) > 1 {
+		if o := strings.TrimSpace(segs[1]); !strings.ContainsAny(o[:1], "0123456789") {
+			orig = o
+		}
+	}
+	year := m[2]
+	if year == "" || len(name) < 2 {
+		return 0
+	}
+	if id := topicByQuery(name+" "+year, name, orig, year); id > 0 {
+		return id
+	}
+	if len(orig) >= 3 {
+		return topicByQuery(orig+" "+year, name, orig, year)
+	}
+	return 0
+}
+
+func topicByQuery(query, name, orig, year string) int {
+	if name == "" || year == "" || len(name) < 2 {
+		return 0
+	}
+	// поиск трекера понимает nm= в utf-8; cp1251-байты он молча
+	// отбрасывает и показывает дефолтную страницу
+	u := nnmBase + "/forum/tracker.php?nm=" + url.QueryEscape(query)
+
+	key := "nm:" + query
+	var body string
+	cacheMu.Lock()
+	if e, ok := rssCache[key]; ok && time.Since(e.ts) < time.Duration(ttl)*time.Second {
+		body = e.body
+		cacheMu.Unlock()
+	} else {
+		cacheMu.Unlock()
+		b, err := fetchNNM(u, "")
+		if err != nil {
+			log.Printf("hashPoster поиск «%s»: %v", query, err)
+			return 0
+		}
+		body = b
+		cacheMu.Lock()
+		rssCache[key] = rssCacheEntry{ts: time.Now(), body: body}
+		markCacheDirty()
+		cacheMu.Unlock()
+	}
+
+	// страница поиска линкует темы через viewtopic.php?t= (топ — через
+	// tracker.php?t=, parseTrackerTop тут не годится)
+	nameL, origL, yearL := strings.ToLower(name), strings.ToLower(orig), year
+	seenTopic := map[int]bool{}
+	for _, m := range searchRowRe.FindAllStringSubmatch(body, -1) {
+		id, _ := strconv.Atoi(m[1])
+		if id == 0 || seenTopic[id] {
+			continue
+		}
+		seenTopic[id] = true
+		t := strings.ToLower(tagRe.ReplaceAllString(m[2], ""))
+		nameHit := nameL != "" && strings.Contains(t, nameL)
+		origHit := origL != "" && strings.Contains(t, origL)
+		if (nameHit || origHit) && strings.Contains(t, yearL) {
+			return id
+		}
+	}
+	log.Printf("hashPoster «%s»: совпадений нет (строк %d)", query, len(seenTopic))
+	return 0
+}
+
+var searchRowRe = regexp.MustCompile(`(?s)<a[^>]*href="viewtopic\.php\?t=(\d+)"[^>]*>(.*?)</a>`)
 
 // ---------- разбор родного rss.php
 
@@ -767,6 +871,59 @@ func parseNNMURL(u string) (kind string, id int) {
 		return "forum", atoiDefault(m[1])
 	}
 	return "", 0
+}
+
+// parseMagnet — btih из магнета (hex или base32 — нормализуем в hex40) и
+// название из dn=. Разовая раздача из плагина Lampa приходит именно магнетом.
+func parseMagnet(u string) (hash, name string) {
+	if !strings.HasPrefix(strings.ToLower(u), "magnet:") {
+		return "", ""
+	}
+	i := strings.IndexByte(u, '?')
+	if i < 0 {
+		return "", ""
+	}
+	q, err := url.ParseQuery(u[i+1:])
+	if err != nil {
+		return "", ""
+	}
+	for _, xt := range q["xt"] {
+		v := strings.ToLower(strings.TrimSpace(xt))
+		if !strings.HasPrefix(v, "urn:btih:") {
+			continue
+		}
+		btih := v[len("urn:btih:"):]
+		if len(btih) == 40 && strings.Trim(btih, "0123456789abcdef") == "" {
+			return btih, q.Get("dn")
+		}
+		if len(btih) == 32 && strings.Trim(btih, "abcdefghijklmnopqrstuvwxyz234567") == "" {
+			if raw, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(btih)); err == nil && len(raw) == 20 {
+				return hex.EncodeToString(raw), q.Get("dn")
+			}
+		}
+	}
+	return "", ""
+}
+
+// magnetPageURL — страница раздачи на трекере из магнета парсера: nnm-магниты
+// несут её в tr=retracker…&comment=viewtopic.php%3Fp%3D… — кодирование
+// вложенное, декодируем в несколько проходов и ищем ссылку на тему.
+// Есть не всегда — раздача может быть не с NNM.
+var magnetPageRe = regexp.MustCompile(`https?://[^\s"'<>]+viewtopic\.php\?[^\s"'<>]*\b[pt]=\d+`)
+
+func magnetPageURL(u string) string {
+	if !strings.HasPrefix(strings.ToLower(u), "magnet:") {
+		return ""
+	}
+	dec := u
+	for i := 0; i < 3; i++ {
+		n, err := url.QueryUnescape(dec)
+		if err != nil || n == dec {
+			break
+		}
+		dec = n
+	}
+	return magnetPageRe.FindString(dec)
 }
 
 // subRSSURL — адрес родной ленты подписки

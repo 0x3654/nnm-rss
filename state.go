@@ -15,17 +15,22 @@ import (
 )
 
 type Sub struct {
-	ID      string `json:"id"`
-	Kind    string `json:"kind"`    // forum | topic
-	NNMID   int    `json:"nnm_id"`  // id раздела или темы
-	Title   string `json:"title"`   // человекочитаемое название
-	Poster  string `json:"poster"`  // для списка подписок и описаний в ленте
-	Filter  string `json:"filter"`  // regexp включения (пустой = всё)
-	Exclude string `json:"exclude"` // regexp исключения
-	Auto    bool   `json:"auto"`    // попадает в авто-ленту (выбор юзера, любой тип)
-	Enabled bool   `json:"enabled"`
-	RootID  int    `json:"root_id,omitempty"` // корневой раздел (для галок «Ленты разделов»)
-	Root    string `json:"root,omitempty"`    // имя корневого раздела
+	ID      string    `json:"id"`
+	Kind    string    `json:"kind"`    // forum | topic | hash
+	NNMID   int       `json:"nnm_id"`  // id раздела или темы
+	Title   string    `json:"title"`   // человекочитаемое название
+	Poster  string    `json:"poster"`  // для списка подписок и описаний в ленте
+	Filter  string    `json:"filter"`  // regexp включения (пустой = всё)
+	Exclude string    `json:"exclude"` // regexp исключения
+	Auto    bool      `json:"auto"`    // попадает в авто-ленту (выбор юзера, любой тип)
+	Enabled bool      `json:"enabled"`
+	RootID  int       `json:"root_id,omitempty"` // корневой раздел (для галок «Ленты разделов»)
+	Root    string    `json:"root,omitempty"`    // имя корневого раздела
+	Hash    string    `json:"hash,omitempty"`    // kind=hash: info-hash разовой раздачи (из сеанса/магнета)
+	Added   time.Time `json:"added,omitempty"`   // kind=hash: когда добавлена (pubDate айтема)
+	Tracker string    `json:"tracker,omitempty"` // kind=hash: трекер из парсера Lampa
+	Size    string    `json:"size,omitempty"`    // kind=hash: размер из парсера Lampa (для показа, пока DHT не собрал .torrent)
+	Page    string    `json:"page,omitempty"`    // kind=hash: страница раздачи на трекере (из tr=/comment магнета парсера)
 }
 
 // HistItem — строка истории «Моя подписка»: что прошло через ленту

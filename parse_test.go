@@ -1,9 +1,14 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/metainfo"
 )
 
 func fixture(t *testing.T, name string) string {
@@ -213,4 +218,113 @@ func TestDedupeTopRows(t *testing.T) {
 	if byTitle[1] || byTitle[2] || byTitle[4] {
 		t.Errorf("дедуп оставил лишние темы: %+v", byTitle)
 	}
+}
+
+// ---------- разовые раздачи: магнет → hash-подписка
+
+func TestParseMagnet(t *testing.T) {
+	// btih того же хэша в base32: 21F3A8C8… → "BIPGCDSMZZF3…" посчитаем честно
+	hexH := "21f3a8c82e2d2375dd337d06c40d73c7a9d09b60"
+
+	cases := []struct {
+		url  string
+		hash string
+		name string
+	}{
+		{"magnet:?xt=urn:btih:" + hexH, hexH, ""},
+		{"magnet:?xt=urn:btih:" + strings.ToUpper(hexH) + "&dn=Movie+2026", hexH, "Movie 2026"},
+		{"magnet:?dn=First&xt=urn:btih:" + hexH, hexH, "First"},
+		{"magnet:?xt=urn:sha1:AAAABBBBCCCCDDDD", "", ""},                   // не btih
+		{"magnet:?xt=urn:btih:12345", "", ""},                              // короткий
+		{"https://nnmclub.to/forum/viewtopic.php?t=1", "", ""},             // не магнет
+		{"magnet:?xt=urn:btih:ehz2rsbofurxlxjtpudmidlty6u5bg3a", hexH, ""}, // base32
+	}
+	for _, c := range cases {
+		hash, name := parseMagnet(c.url)
+		check(t, c.url, hash == c.hash && name == c.name, hash, name)
+	}
+}
+
+func TestBuildFeedHashSub(t *testing.T) {
+	// профиль только с hash-подпиской: сети нет, selfURL пуст — link = магнет
+	p := &Profile{Passkey: randHex(16)}
+	p.Subs = []*Sub{{
+		ID: "ab12", Kind: "hash", Hash: "21f3a8c82e2d2375dd337d06c40d73c7a9d09b60",
+		Title: "Movie 2026 WEB-DL", Auto: true, Enabled: true,
+		Added: time.Now().Add(-time.Hour),
+	}}
+
+	body, hist, err := buildFeed(p, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, "авто: один item", len(hist) == 1, len(hist))
+	check(t, "guid с хэшем", hist[0].GUID == "nnm-hash21f3a8c82e2d2375dd337d06c40d73c7a9d09b60", hist[0].GUID)
+	check(t, "link — магнет", strings.HasPrefix(hist[0].URL, "magnet:?xt=urn:btih:21f3a8"), hist[0].URL)
+	check(t, "название", hist[0].Title == "Movie 2026 WEB-DL", hist[0].Title)
+	check(t, "item в XML", strings.Contains(string(body), "nnm-hash21f3a8c8"), len(body))
+
+	// общая лента (/all) разовых раздач не содержит
+	_, histAll, err := buildFeed(p, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, "all: пусто", len(histAll) == 0, len(histAll))
+
+	// фильтр auto на разовую раздачу не действует (явное желание юзера)
+	p.Filters = map[string]*FeedFilter{"auto": {Exclude: "WEB-DL"}}
+	cacheMu.Lock()
+	feedCache = map[string]feedCacheEntry{}
+	cacheMu.Unlock()
+	_, hist2, _ := buildFeed(p, false)
+	check(t, "фильтр не гасит hash-айтем", len(hist2) == 1, len(hist2))
+}
+
+// ---------- страница раздачи /t/<hash>
+
+func TestTorrentPage(t *testing.T) {
+	old := os.Getenv("DATA_DIR")
+	os.Setenv("DATA_DIR", t.TempDir())
+	t.Cleanup(func() { os.Setenv("DATA_DIR", old) })
+	initTorrents()
+
+	h := "47064afc564cca0128dda85b98ecfb517a9ad638"
+
+	// без файла: страница-ожидание с авторефрешем; инфа от парсера — в тексте
+	p := torrentPageHTML(&Sub{Kind: "hash", Hash: h, Title: "Runner.2026",
+		Tracker: "nnm-club", Size: "7.2 ГБ", Added: time.Now()})
+	check(t, "ожидание: заголовок", strings.Contains(p, "Runner.2026"))
+	check(t, "ожидание: авторефреш", strings.Contains(p, "http-equiv=\"refresh\""))
+	check(t, "ожидание: магнет с трекерами", strings.Contains(p, "magnet:?xt=urn:btih:"+h+"&tr="))
+	check(t, "ожидание: трекер и размер от парсера", strings.Contains(p, "nnm-club · 7.2 ГБ"))
+
+	// минимальный валидный .torrent (один файл)
+	info := map[string]any{"name": "Runner.2026.mkv", "length": int64(1234567),
+		"piece length": 262144, "pieces": strings.Repeat("x", 20)}
+	ib, _ := bencode.Marshal(info)
+	raw, _ := bencode.Marshal(metainfo.MetaInfo{InfoBytes: ib})
+	if err := os.WriteFile(torrentPath(h), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p = torrentPageHTML(&Sub{Kind: "hash", Hash: h, Title: "Runner.2026 (из Lampa)",
+		Page: "https://nnmclub.to/forum/viewtopic.php?t=123"})
+	check(t, "готово: не ждёт", !strings.Contains(p, "ещё собирает"))
+	check(t, "готово: h1 — настоящее имя раздачи", strings.Contains(p, "<h1>Runner.2026.mkv</h1>"))
+	check(t, "готово: файл с размером", strings.Contains(p, "Runner.2026.mkv") && strings.Contains(p, "1.2 МБ"))
+	check(t, "готово: ссылка на .torrent", strings.Contains(p, "/t/"+h+".torrent"))
+	check(t, "готово: ссылка на трекер", strings.Contains(p, "viewtopic.php?t=123"))
+}
+
+func TestMagnetPageURL(t *testing.T) {
+	// nnm-магнит парсера: viewtopic прячется в tr=retracker…&comment=… (вложенное кодирование)
+	nnm := "magnet:?xt=urn:btih:" + strings.Repeat("ab", 20) +
+		"&tr=" + url.QueryEscape("http://retracker.local/announce.php?size=6111021357&comment=http%3A%2F%2Fnnmclub.to%2Fforum%2Fviewtopic.php%3Fp%3D13105047&name=x")
+	got := magnetPageURL(nnm)
+	check(t, "viewtopic из tr-comment", strings.Contains(got, "http://nnmclub.to/forum/viewtopic.php?p=13105047"), got)
+
+	pub := "magnet:?xt=urn:btih:" + strings.Repeat("cd", 20) + "&tr=" + url.QueryEscape("udp://tracker.opentrackr.org:1337/announce")
+	check(t, "без viewtopic — пусто", magnetPageURL(pub) == "")
+
+	check(t, "не магнет — пусто", magnetPageURL("https://x/y") == "")
 }

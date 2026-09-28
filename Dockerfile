@@ -29,7 +29,7 @@ FROM scratch
 ARG GIT_REV=unknown
 LABEL org.opencontainers.image.title="nnm-rss" \
       org.opencontainers.image.description="Личные RSS-ленты NNM-Club (мультиюзерный сервис в духе lostfilmfeed)" \
-      org.opencontainers.image.source="https://github.com/0x3654/transmission-send" \
+      org.opencontainers.image.source="https://github.com/0x3654/lampa-plugins" \
       org.opencontainers.image.revision="${GIT_REV}"
 COPY --from=build /out/nnm-rss /nnm-rss
 COPY --from=build /out/healthcheck /healthcheck

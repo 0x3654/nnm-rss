@@ -7,7 +7,10 @@ package main
 // навсегда в DATA_DIR/torrents (том /data).
 
 import (
+	"fmt"
+	"html"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,4 +154,121 @@ func torrentFileValid(hash string) bool {
 	}
 	var mi metainfo.MetaInfo
 	return bencode.Unmarshal(raw, &mi) == nil && len(mi.InfoBytes) > 0
+}
+
+// humanSize — человекочитаемый размер для страницы раздачи
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f ГБ", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f МБ", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f КБ", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d Б", n)
+}
+
+// magnetWithTrackers — магнет с публичными трекерами (страница раздачи: клик
+// должен сразу находить пиров; в лентах по-прежнему голый btih)
+func magnetWithTrackers(hash string) string {
+	u := "magnet:?xt=urn:btih:" + hash
+	for _, tr := range publicTrackers {
+		u += "&tr=" + url.QueryEscape(tr)
+	}
+	return u
+}
+
+// torrentPageHTML — страница раздачи /t/<hash> для разовой подписки (kind=hash):
+// прямой ссылки на трекер у такой раздачи часто нет (она может быть не с NNM),
+// «что это» смотрим у нас — название, размер, список файлов из .torrent,
+// магнет и скачивание; если парсер Lampa передал трекер/страницу раздачи
+// (nnm-магниты несут viewtopic в tr=) — показываем и их. Файла ещё нет —
+// страница сама обновится (meta refresh), параллельно пинаем DHT-резолвер.
+func torrentPageHTML(s *Sub) string {
+	hash := s.Hash
+	ready := torrentFileValid(hash)
+	if !ready {
+		prefetchTorrent(hash)
+	}
+
+	hdr := "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">" +
+		"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+		"<title>" + html.EscapeString(s.Title) + " — раздача</title>" +
+		"<meta http-equiv=\"refresh\" content=\"15\">" +
+		"<style>" +
+		":root{--accent:#c2410c;--accent-txt:#fff;--bg:#f2f4f7;--card:#fff;--text:#222;--muted:#7a828c;--line:#dde2e8}" +
+		"@media (prefers-color-scheme: dark){:root{--accent:#c2623d;--accent-txt:#2c2525;--bg:#221f20;--card:#2c2828;--text:#f0e6c8;--muted:#8b8481;--line:#413b3b}}" +
+		"*{box-sizing:border-box}body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;background:var(--bg);color:var(--text)}" +
+		".wrap{max-width:640px;margin:40px auto;padding:0 16px}" +
+		".card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px}" +
+		"h1{font-size:17px;margin:0 0 6px;word-break:break-word}" +
+		".muted{color:var(--muted);font-size:13px}" +
+		".row{margin:14px 0 0}.row a{color:var(--accent);text-decoration:none}" +
+		"ul{margin:8px 0 0;padding-left:20px;font-size:13px}li{margin:3px 0;word-break:break-all}" +
+		".sz{color:var(--muted);margin-left:6px;white-space:nowrap}" +
+		"</style></head><body><div class=\"wrap\"><div class=\"card\">"
+
+	heading := s.Title
+	var facts []string
+
+	if ready {
+		if mi, err := metainfo.LoadFromFile(torrentPath(hash)); err == nil {
+			if info, err := mi.UnmarshalInfo(); err == nil {
+				// название из .torrent — настоящее имя раздачи (красивее
+				// файлового dn из плагина); подпись подписки — запасной вариант
+				heading = info.Name
+				if heading == "" {
+					heading = s.Title
+				}
+				facts = append(facts, humanSize(info.TotalLength())+" всего")
+				fs := info.UpvertedFiles()
+				const capFiles = 300
+				for i, f := range fs {
+					if i == capFiles {
+						facts = append(facts, fmt.Sprintf("и ещё %d файлов", len(fs)-capFiles))
+						break
+					}
+					nm := strings.Join(f.Path, "/")
+					if nm == "" {
+						nm = info.Name // однофайловый торрент: имени в Path нет
+					}
+					facts = append(facts, html.EscapeString(nm)+
+						"<span class=\"sz\">"+humanSize(f.Length)+"</span>")
+				}
+			}
+		}
+	} else {
+		wait := "DHT-резолвер ещё собирает .torrent — страница обновится сама"
+		if s.Size != "" {
+			wait += " (по данным парсера: " + html.EscapeString(s.Size) + ")"
+		}
+		facts = append(facts, wait)
+	}
+
+	if info := s.Tracker; info != "" || s.Size != "" {
+		if s.Size != "" {
+			if info != "" {
+				info += " · "
+			}
+			info += s.Size
+		}
+		facts = append(facts, html.EscapeString(info))
+	}
+	if !s.Added.IsZero() {
+		facts = append(facts, "добавлена из Lampa: "+s.Added.In(tz).Format("02.01.2006 15:04"))
+	}
+
+	links := "<div class=\"row\"><a href=\"" + magnetWithTrackers(hash) + "\">магнет</a>" +
+		" · <a href=\"/t/" + hash + ".torrent\">скачать .torrent</a>"
+	if s.Page != "" {
+		links += " · <a href=\"" + html.EscapeString(s.Page) + "\" target=\"_blank\" rel=\"noopener\">раздача на трекере ↗</a>"
+	}
+	links += "</div>"
+
+	out := hdr + "<h1>" + html.EscapeString(heading) + "</h1>" +
+		"<p class=\"muted\">Разовая раздача · info-hash <code>" + hash + "</code></p>" +
+		"<ul><li>" + strings.Join(facts, "</li><li>") + "</li></ul>" +
+		links + "</div></div></body></html>"
+	return out
 }
