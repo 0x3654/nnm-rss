@@ -5,7 +5,7 @@
 **Personal RSS feeds for NNM Club torrents**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-0x3654.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/image-ghcr.io%2F0x3654%2Fnnm--rss-2496ED.svg)](https://github.com/0x3654/nnm-rss/pkgs/container/nnm-rss)
+[![Docker](https://img.shields.io/badge/image-docker.io%2F0x3654%2Fnnm--rss-2496ED.svg)](https://hub.docker.com/r/0x3654/nnm-rss)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8.svg)](https://go.dev)
 
 [What is this](#what-is-this) · [Feeds](#feeds) · [Deploy](#deploy) · [API](#api) · [Plugin integration](#plugin-integration) · [О русском](#по-русски)
@@ -59,7 +59,7 @@ docker run -d --name nnm-rss \
   -p 8356:8356 -v nnm-rss-data:/data \
   -e PUBLIC_URL=https://nnm.example.com \
   -e OMDB_APIKEY=… \
-  ghcr.io/0x3654/nnm-rss:latest
+  docker.io/0x3654/nnm-rss:latest
 ```
 
 CI builds a scratch multi-arch image (deps → test → build, non-root, healthcheck).
