@@ -8,6 +8,7 @@ package main
 import (
 	"encoding/base32"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -530,6 +531,163 @@ func malRating(link string) (val, votes string) {
 	markCacheDirty()
 	cacheMu.Unlock()
 	return val, votes
+}
+
+var (
+	// ключ клиента Lampa — публичный (как в tracker-top), свой — через env
+	tmdbKey = env("TMDB_APIKEY", "4ef0d7355d9ffb5151e987764708ce96")
+	tmdbAPI = "https://api.themoviedb.org/3/"
+)
+
+type tmdbHit struct {
+	VoteAverage float64 `json:"vote_average"`
+	VoteCount   int     `json:"vote_count"`
+}
+
+// tmdbRating — рейтинг TMDB для карточки разовой раздачи: по IMDb-id из
+// страницы темы (/find — однозначный матч), иначе поиск по названию и году
+// (фильм, затем сериал; русское имя, затем оригинал — как в поиске раздач).
+// Кэш на TTL (вместе с «не нашли»), как у IMDb/MAL
+func tmdbRating(imdbID, title string) (val, votes string) {
+	cacheKey := "tmdb:" + imdbID + "|" + title
+	cacheMu.Lock()
+	if e, ok := resolveCache[cacheKey]; ok && time.Since(e.ts) < time.Duration(ttl)*time.Second {
+		cacheMu.Unlock()
+		return e.rel.Hash, e.rel.Descr
+	}
+	cacheMu.Unlock()
+
+	if hit, ok := tmdbLookup(imdbID, title); ok && hit.VoteCount > 0 {
+		val = strconv.FormatFloat(hit.VoteAverage, 'f', 1, 64)
+		votes = groupDigits(hit.VoteCount)
+	}
+
+	cacheMu.Lock()
+	resolveCache[cacheKey] = resolveEntry{ts: time.Now(), rel: Release{Hash: val, Descr: votes}}
+	markCacheDirty()
+	cacheMu.Unlock()
+	return val, votes
+}
+
+func tmdbLookup(imdbID, title string) (tmdbHit, bool) {
+	if imdbID != "" {
+		if h, ok := tmdbFetch("find/"+imdbID, url.Values{
+			"external_source": {"imdb_id"},
+		}); ok {
+			return h, true
+		}
+	}
+	name, orig, year := nameOrigYear(title)
+	for _, q := range []string{name, orig} {
+		if len(q) < 2 {
+			continue
+		}
+		for _, kind := range []string{"movie", "tv"} {
+			v := url.Values{"query": {q}}
+			if year != "" {
+				// год у фильма и сериала — разные параметры
+				if kind == "movie" {
+					v.Set("year", year)
+				} else {
+					v.Set("first_air_date_year", year)
+				}
+			}
+			if h, ok := tmdbFetch("search/"+kind, v); ok {
+				return h, true
+			}
+		}
+	}
+	return tmdbHit{}, false
+}
+
+// tmdbFetch — GET к TMDB (language=ru): /find отдаёт movie_result/tv_result,
+// /search/* — results; из списка берём первый результат с голосами
+func tmdbFetch(endpoint string, q url.Values) (tmdbHit, bool) {
+	q.Set("api_key", tmdbKey)
+	q.Set("language", "ru")
+	req, err := http.NewRequest("GET", tmdbAPI+endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return tmdbHit{}, false
+	}
+	req.Header.Set("User-Agent", nnmUA)
+	resp, err := nnmClient.Do(req)
+	if err != nil {
+		return tmdbHit{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return tmdbHit{}, false
+	}
+	var body struct {
+		Results      []tmdbHit `json:"results"`       // /search/*
+		MovieResults []tmdbHit `json:"movie_results"` // /find — во множественном
+		TvResults    []tmdbHit `json:"tv_results"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&body) != nil {
+		return tmdbHit{}, false
+	}
+	for _, list := range [][]tmdbHit{body.MovieResults, body.TvResults, body.Results} {
+		if h, ok := tmdbPick(list); ok {
+			return h, true
+		}
+	}
+	return tmdbHit{}, false
+}
+
+// tmdbPick — первый результат с голосами: единичный голос даёт мусорные
+// 10.0, поэтому сперва ищем ≥10 голосов, потом любой >0
+func tmdbPick(list []tmdbHit) (tmdbHit, bool) {
+	for _, h := range list {
+		if h.VoteCount >= 10 {
+			return h, true
+		}
+	}
+	for _, h := range list {
+		if h.VoteCount > 0 {
+			return h, true
+		}
+	}
+	return tmdbHit{}, false
+}
+
+var yearAnyRe = regexp.MustCompile(`\b((19|20)\d{2})\b`)
+
+// nameOrigYear — «Курьер / Runner / 2026 / ДБ / WEB-DL (1080p)» → «Курьер»,
+// «Runner», «2026» (поиск TMDB, как parseTitle в tracker-top)
+func nameOrigYear(title string) (name, orig, year string) {
+	if m := hashNameYearRe.FindStringSubmatch(title); m != nil {
+		name, year = m[1], m[2]
+	} else {
+		// года нет — ищем просто по названию
+		name = title
+		if y := yearAnyRe.FindStringSubmatch(title); y != nil {
+			year = y[1]
+		}
+	}
+	// запасной сценарий отдаёт имя целиком: режем на год/скобки/слэши
+	name = strings.Split(name, "(")[0]
+	name = strings.TrimSpace(yearAnyRe.ReplaceAllString(name, ""))
+	name = strings.TrimSpace(spaceRe.ReplaceAllString(name, " "))
+	if segs := strings.Split(title, "/"); len(segs) > 1 {
+		// оригинал — второй сегмент; год-сегмент (« / 2026 / ») и техданные мимо
+		o := strings.TrimSpace(strings.Split(segs[1], "(")[0])
+		if len(o) >= 2 && !strings.ContainsAny(o[:1], "0123456789") {
+			orig = o
+		}
+	}
+	if len([]rune(name)) < 2 {
+		name = ""
+	}
+	return name, orig, year
+}
+
+// groupDigits — 12345 → «12 345» (голоса на карточке)
+func groupDigits(n int) string {
+	s := strconv.Itoa(n)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + " " + s[i:]
+	}
+	return s
 }
 
 // topicInfo — название, постер и id темы (для страницы подписок).

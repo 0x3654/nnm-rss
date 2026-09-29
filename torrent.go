@@ -182,9 +182,10 @@ func magnetWithTrackers(hash string) string {
 // torrentPageHTML — страница раздачи /t/<hash> для разовой подписки (kind=hash):
 // прямой ссылки на трекер у такой раздачи часто нет (она может быть не с NNM),
 // «что это» смотрим у нас — название, размер, список файлов из .torrent,
-// магнет и скачивание; если парсер Lampa передал трекер/страницу раздачи
-// (nnm-магниты несут viewtopic в tr=) — показываем и их. Файла ещё нет —
-// страница сама обновится (meta refresh), параллельно пинаем DHT-резолвер.
+// магнет и скачивание; ссылку на раздачу показываем из парсера Lampa
+// (nnm-магниты несут viewtopic в tr=), а если её нет — на найденную поиском
+// тему NNM. Файла ещё нет — страница сама обновится (meta refresh),
+// параллельно пинаем DHT-резолвер.
 func torrentPageHTML(s *Sub) string {
 	hash := s.Hash
 	ready := torrentFileValid(hash)
@@ -259,52 +260,86 @@ func torrentPageHTML(s *Sub) string {
 		facts = append(facts, "добавлена из Lampa: "+s.Added.In(tz).Format("02.01.2006 15:04"))
 	}
 
+	// карточка заодно знает тему NNM — прямой ссылки у магнита из плагина
+	// часто нет, а тема найдена поиском по названию
+	card, nnmURL := hashCard(s)
+
 	links := "<div class=\"row\"><a href=\"" + magnetWithTrackers(hash) + "\">магнет</a>" +
 		" · <a href=\"/t/" + hash + ".torrent\">скачать .torrent</a>"
 	if s.Page != "" {
 		links += " · <a href=\"" + html.EscapeString(s.Page) + "\" target=\"_blank\" rel=\"noopener\">раздача на трекере ↗</a>"
+	} else if nnmURL != "" {
+		links += " · <a href=\"" + html.EscapeString(nnmURL) + "\" target=\"_blank\" rel=\"noopener\">раздача на NNM ↗</a>"
 	}
 	links += "</div>"
 
 	out := hdr + "<h1>" + html.EscapeString(heading) + "</h1>" +
 		"<p class=\"muted\">Разовая раздача · info-hash <code>" + hash + "</code></p>" +
-		hashCard(s) +
+		card +
 		"<ul><li>" + strings.Join(facts, "</li><li>") + "</li></ul>" +
 		links + "</div></div></body></html>"
 	return out
 }
 
-// hashCard — карточка на странице /t/<hash>: описание и обложка как в лентах.
-// Темы у разовой раздачи нет — находим её на трекере по названию из парсера
-// Lampa (поиск и резолв страницы темы уже под кэшем)
-func hashCard(s *Sub) string {
+// hashCard — карточка на странице /t/<hash>: описание и обложка как в лентах,
+// рейтинги Кинопоиска (картинкой, как в ленте) и TMDB. Темы у разовой раздачи
+// нет — находим её на трекере по названию из парсера Lampa (поиск и резолв
+// страницы темы уже под кэшем). Вторым значением — ссылка на найденную тему
+// NNM: у магнита из плагина её часто нет, а тема-то найдена.
+func hashCard(s *Sub) (string, string) {
 	if s.Title == "" {
-		return ""
+		return "", ""
 	}
 	id := searchTopicID(s.Title)
 	if id == 0 {
-		return ""
+		return "", ""
 	}
 	rel, err := resolveRelease(id)
 	if err != nil {
-		return ""
+		return "", ""
 	}
+	nnmURL := fmt.Sprintf("%s/forum/viewtopic.php?t=%d", nnmBase, id)
+
+	// рейтинги: КП — готовая картинка из темы; TMDB — по IMDb-id темы, при
+	// его отсутствии поиском по названию из плагина
+	tmdbVal, tmdbVotes := tmdbRating(imdbTT(rel.IMDb), s.Title)
 
 	var side, fields strings.Builder
 	if rel.Poster != "" {
-		side.WriteString(`<img src="` + html.EscapeString(rel.Poster) + `" alt="" style="width:160px;border-radius:8px;flex:none;max-width:40%">`)
+		// align-items:flex-start обязателен: без него flex-stretch тянет
+		// картинку по высоте колонки полей и постер «плывёт»
+		side.WriteString(`<img src="` + html.EscapeString(rel.Poster) + `" alt="" style="width:160px;height:auto;border-radius:8px;flex:none;max-width:40%">`)
 	}
 	for _, t := range rel.Tech {
 		v := strings.ReplaceAll(html.EscapeString(t.Value), "¶", "<br>")
 		fields.WriteString(`<div style="margin:2px 0"><b>` + html.EscapeString(t.Name) + `:</b> ` + v + `</div>`)
 	}
-	block := `<div style="display:flex;gap:14px;flex-wrap:wrap;margin:16px 0 0">` +
+
+	var ratings strings.Builder
+	if rel.RatingImg != "" {
+		ratings.WriteString(`<img src="` + html.EscapeString(rel.RatingImg) + `" alt="Кинопоиск" style="vertical-align:middle;margin-right:10px">`)
+	}
+	if tmdbVal != "" {
+		votes := ""
+		if tmdbVotes != "" {
+			votes = ` <span style="font-size:11px;color:#9fb1c5">(` + tmdbVotes + `)</span>`
+		}
+		ratings.WriteString(`<span style="display:inline-block;vertical-align:middle;border-radius:8px;background:#0d253f;color:#fff;padding:7px 10px;white-space:nowrap">` +
+			`<span style="background:#01b4e4;color:#082c44;font-weight:bold;border-radius:4px;padding:1px 6px;font-size:11px">TMDB</span>` +
+			` <span style="font-size:18px;font-weight:bold">` + tmdbVal + `</span>` + votes + `</span>`)
+	}
+	ratingsRow := ""
+	if ratings.Len() > 0 {
+		ratingsRow = `<div style="margin:0 0 10px">` + ratings.String() + `</div>`
+	}
+
+	block := `<div style="display:flex;gap:14px;flex-wrap:wrap;margin:16px 0 0;align-items:flex-start">` +
 		side.String() +
-		`<div style="flex:1;min-width:220px;font-size:13.5px">` + fields.String() + `</div></div>`
+		`<div style="flex:1;min-width:220px;font-size:13.5px">` + ratingsRow + fields.String() + `</div></div>`
 
 	if rel.Descr != "" {
 		plot := strings.ReplaceAll(html.EscapeString(rel.Descr), "¶", "<br><br>")
 		block += `<div style="margin:12px 0 0;font-size:13.5px">` + plot + `</div>`
 	}
-	return block
+	return block, nnmURL
 }

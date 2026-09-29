@@ -328,3 +328,45 @@ func TestMagnetPageURL(t *testing.T) {
 
 	check(t, "не магнет — пусто", magnetPageURL("https://x/y") == "")
 }
+
+// ---------- рейтинги TMDB (карточка /t/<hash>)
+
+func TestNameOrigYear(t *testing.T) {
+	cases := []struct{ in, name, orig, year string }{
+		// dn плагина Lampa: имя / оригинал / год / техданные
+		{"Курьер / Runner / 2026 / ДБ / WEB-DL (1080p)", "Курьер", "Runner", "2026"},
+		{"Пастор и рыжий пес / A Pastor and a Red Dog / 2025 / ДБ, ПД / WEB-DL (1080p)", "Пастор и рыжий пес", "A Pastor and a Red Dog", "2025"},
+		// название темы NNM: год в скобках
+		{"Заложница / Taken (2008) BDRip", "Заложница", "Taken", "2008"},
+		// без оригинала и без года
+		{"Просто название", "Просто название", "", ""},
+		// год-сегмент не применим за оригинал
+		{"Сериал / 2024 / ДБ / HDTVRip", "Сериал", "", "2024"},
+	}
+	for _, c := range cases {
+		name, orig, year := nameOrigYear(c.in)
+		check(t, "name «"+c.in+"»", name == c.name, name)
+		check(t, "orig «"+c.in+"»", orig == c.orig, orig)
+		check(t, "year «"+c.in+"»", year == c.year, year)
+	}
+}
+
+func TestTmdbPick(t *testing.T) {
+	list := []tmdbHit{{VoteAverage: 10, VoteCount: 1}, {VoteAverage: 6.8, VoteCount: 345}}
+	h, ok := tmdbPick(list)
+	check(t, "первый с ≥10 голосов", ok && h.VoteCount == 345)
+
+	h, ok = tmdbPick([]tmdbHit{{VoteAverage: 7, VoteCount: 2}})
+	check(t, "нет массовых — берём любой с голосами", ok && h.VoteCount == 2)
+
+	_, ok = tmdbPick([]tmdbHit{{VoteAverage: 0, VoteCount: 0}})
+	check(t, "без голосов — пусто", !ok)
+	_, ok = tmdbPick(nil)
+	check(t, "пустой список — пусто", !ok)
+}
+
+func TestGroupDigits(t *testing.T) {
+	check(t, "12345", groupDigits(12345) == "12 345")
+	check(t, "999", groupDigits(999) == "999")
+	check(t, "1 000 000", groupDigits(1000000) == "1 000 000")
+}
