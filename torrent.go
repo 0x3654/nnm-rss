@@ -268,7 +268,43 @@ func torrentPageHTML(s *Sub) string {
 
 	out := hdr + "<h1>" + html.EscapeString(heading) + "</h1>" +
 		"<p class=\"muted\">Разовая раздача · info-hash <code>" + hash + "</code></p>" +
+		hashCard(s) +
 		"<ul><li>" + strings.Join(facts, "</li><li>") + "</li></ul>" +
 		links + "</div></div></body></html>"
 	return out
+}
+
+// hashCard — карточка на странице /t/<hash>: описание и обложка как в лентах.
+// Темы у разовой раздачи нет — находим её на трекере по названию из парсера
+// Lampa (поиск и резолв страницы темы уже под кэшем)
+func hashCard(s *Sub) string {
+	if s.Title == "" {
+		return ""
+	}
+	id := searchTopicID(s.Title)
+	if id == 0 {
+		return ""
+	}
+	rel, err := resolveRelease(id)
+	if err != nil {
+		return ""
+	}
+
+	var side, fields strings.Builder
+	if rel.Poster != "" {
+		side.WriteString(`<img src="` + html.EscapeString(rel.Poster) + `" alt="" style="width:160px;border-radius:8px;flex:none;max-width:40%">`)
+	}
+	for _, t := range rel.Tech {
+		v := strings.ReplaceAll(html.EscapeString(t.Value), "¶", "<br>")
+		fields.WriteString(`<div style="margin:2px 0"><b>` + html.EscapeString(t.Name) + `:</b> ` + v + `</div>`)
+	}
+	block := `<div style="display:flex;gap:14px;flex-wrap:wrap;margin:16px 0 0">` +
+		side.String() +
+		`<div style="flex:1;min-width:220px;font-size:13.5px">` + fields.String() + `</div></div>`
+
+	if rel.Descr != "" {
+		plot := strings.ReplaceAll(html.EscapeString(rel.Descr), "¶", "<br><br>")
+		block += `<div style="margin:12px 0 0;font-size:13.5px">` + plot + `</div>`
+	}
+	return block
 }
