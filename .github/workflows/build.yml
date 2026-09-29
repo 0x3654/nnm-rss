@@ -1,17 +1,19 @@
 name: build
 
-# Docker Hub image (practice as in v8dock):
-# requires repo secrets DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (hub.docker.com)
 'on':
   push:
     branches: [main]
   workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/nnm-rss
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -21,8 +23,9 @@ jobs:
 
       - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -32,7 +35,7 @@ jobs:
             GIT_REV=${{ github.sha }}
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/nnm-rss:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/nnm-rss:1
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:1
           cache-from: type=gha
           cache-to: type=gha,mode=max
