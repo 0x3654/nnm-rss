@@ -158,6 +158,25 @@ func TestParseNNMURL(t *testing.T) {
 	}
 }
 
+// p= ссылка резолвится в свою тему: виджет благодарностей под каждым постом
+// ведёт в служебную «Доску почета» и по частоте побеждал бы саму тему
+// (репро p=13119948 → t=1891932, 13 ссылок t=15061 против 7 своих)
+func TestPostTopicSelf(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`<h1><a class="maintitle" href="viewtopic.php?t=1891932">Унабомбер / Unabomber (2026)</a></h1>`)
+	for i := 0; i < 13; i++ {
+		b.WriteString(`<div><a href="viewtopic.php?t=15061" rel="nofollow"><img src="5star.gif"></a></div>`)
+	}
+	b.WriteString(`Страницы: <a href="viewtopic.php?t=1891932&amp;start=15#pagestart">2</a>`)
+	check(t, "maintitle бьёт частоту благодарностей", postTopicSelf(b.String()) == 1891932)
+
+	page := `<a href="viewtopic.php?t=1891932&amp;start=15#pagestart">2</a>` +
+		`<a href="viewtopic.php?t=1891932&amp;start=30#pagestart">След.</a>`
+	check(t, "без maintitle — тема из пагинации", postTopicSelf(page) == 1891932)
+
+	check(t, "без своей темы — 0, а не угаданная", postTopicSelf(`<a href="viewtopic.php?t=15061">x</a>`) == 0)
+}
+
 // ---------- gid ↔ (kind, id)
 
 func TestGidParse(t *testing.T) {

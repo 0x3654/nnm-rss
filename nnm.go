@@ -294,7 +294,12 @@ var (
 	torNameRe  = regexp.MustCompile(`<b>(\[NNM[-.]?Club[^<]*?\.torrent)</b>`)
 	torSizeRe  = regexp.MustCompile(`(\d+(?:[.,]\d+)?(?:&nbsp;|\s)*(?:KB|MB|GB|КБ|МБ|ГБ))`)
 
-	postSelfRef = regexp.MustCompile(`viewtopic\.php\?t=(\d+)`)
+	// своя тема на странице p=: ссылка в заголовке (maintitle) и пагинация
+	// (t=…&start=). Частоту голых t= не считаем: виджет благодарностей под
+	// каждым постом ведёт в служебную тему «Доска почета» (t=15061) и в
+	// обсуждаемых раздачах побеждает по частоте саму тему
+	postSelfTitle = regexp.MustCompile(`<a[^>]*class="maintitle"[^>]*>`)
+	postSelfPage  = regexp.MustCompile(`viewtopic\.php\?t=(\d+)&amp;start=`)
 )
 
 // Release — всё, что достаём со страницы раздачи одним запросом.
@@ -691,7 +696,7 @@ func groupDigits(n int) string {
 }
 
 // topicInfo — название, постер и id темы (для страницы подписок).
-// Если передан пост (kind=post): достаём тему по частоте ссылок t= на странице
+// Если передан пост (kind=post): достаём тему из заголовка страницы
 func topicInfo(kind string, id int) (topicID int, title, poster string, err error) {
 	if kind == "post" {
 		body, ferr := fetchNNM(fmt.Sprintf("%s/forum/viewtopic.php?p=%d", nnmBase, id), "")
@@ -701,21 +706,11 @@ func topicInfo(kind string, id int) (topicID int, title, poster string, err erro
 		if strings.TrimSpace(body) == "" {
 			return 0, "", "", errDeepPost
 		}
-		// своя тема встречается на странице чаще всего (пагинация, заголовок)
-		counts := map[int]int{}
-		for _, m := range postSelfRef.FindAllStringSubmatch(body, -1) {
-			counts[atoiDefault(m[1])]++
-		}
-		best, bestN := 0, 0
-		for t, n := range counts {
-			if n > bestN {
-				best, bestN = t, n
-			}
-		}
-		if best == 0 {
+		if self := postTopicSelf(body); self != 0 {
+			id = self
+		} else {
 			return 0, "", "", errDeepPost
 		}
-		id = best
 	}
 
 	body, ferr := fetchNNM(fmt.Sprintf("%s/forum/viewtopic.php?t=%d", nnmBase, id), "")
@@ -734,6 +729,20 @@ func topicInfo(kind string, id int) (topicID int, title, poster string, err erro
 }
 
 var errDeepPost = errors.New("пост не открывается без раздела: откройте тему целиком и скопируйте ссылку с t=…")
+
+// postTopicSelf — id темы, которой принадлежит пост, со страницы viewtopic?p=:
+// сначала ссылка в заголовке (maintitle), затем пагинация (t=…&start=)
+func postTopicSelf(body string) int {
+	if tag := postSelfTitle.FindString(body); tag != "" {
+		if m := linkTopicRe.FindStringSubmatch(tag); m != nil {
+			return atoiDefault(m[1])
+		}
+	}
+	if m := postSelfPage.FindStringSubmatch(body); m != nil {
+		return atoiDefault(m[1])
+	}
+	return 0
+}
 
 // magnetLink — магнит ленты: только btih, без announce. На nnm ключи минтятся
 // сайтом на каждое скачивание (в магнит/.torrent залогиненного), константный
